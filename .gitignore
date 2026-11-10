@@ -1,0 +1,10 @@
+# 运行时生成的个人数据，不进仓库
+shots/
+log.txt
+log.txt.old
+settings.ini
+probe*.txt
+
+# 编译产物（放到 Releases 里）
+*.exe
+*.zip

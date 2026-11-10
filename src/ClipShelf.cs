@@ -23,8 +23,8 @@ using Microsoft.Win32;
 
 [assembly: AssemblyTitle("截图盒")]
 [assembly: AssemblyProduct("截图盒 ClipShelf")]
-[assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.0.0")]
+[assembly: AssemblyVersion("1.1.0.0")]
+[assembly: AssemblyFileVersion("1.1.0.0")]
 
 namespace ClipShelf
 {
@@ -1946,6 +1946,12 @@ namespace ClipShelf
             if (a0 == "--install") { Install(baseDir); return 0; }
             if (a0 == "--uninstall") { try { Autostart.Set(false); } catch { } return 0; }
             if (a0 == "--snapshot") return Snapshot(args);
+            if (a0 == "--quit")
+            {
+                // 安装 / 卸载程序用：让从这个文件夹运行的截图盒正常退出（别处的副本不受影响）
+                try { using (EventWaitHandle q = EventWaitHandle.OpenExisting(QuitEventName(baseDir))) q.Set(); } catch { }
+                return 0;
+            }
             if (a0 == "--test-shelldata")
             {
                 // --test-shelldata out.txt file1 [file2 ...]：列出拖拽数据里有哪些格式
@@ -1974,6 +1980,7 @@ namespace ClipShelf
                     return 0;
                 }
                 EventWaitHandle showEv = new EventWaitHandle(false, EventResetMode.AutoReset, @"Local\ClipShelf.Show.v1");
+                EventWaitHandle quitEv = new EventWaitHandle(false, EventResetMode.AutoReset, QuitEventName(baseDir));
                 Application.ThreadException += delegate(object s, ThreadExceptionEventArgs e) { Log.W("未处理异常: " + e.Exception); };
                 AppDomain.CurrentDomain.UnhandledException += delegate(object s, UnhandledExceptionEventArgs e) { Log.W("致命异常: " + e.ExceptionObject); };
 
@@ -1985,18 +1992,33 @@ namespace ClipShelf
                 {
                     while (true)
                     {
-                        showEv.WaitOne();
+                        int which = WaitHandle.WaitAny(new WaitHandle[] { showEv, quitEv });
+                        if (which == 1)
+                        {
+                            Log.W("收到退出请求（安装 / 卸载）");
+                            try { form.BeginInvoke(new Action(form.Close)); } catch { }
+                            return;
+                        }
                         try { form.BeginInvoke(new Action(form.ShowFromSignal)); } catch { }
                     }
                 });
                 th.IsBackground = true;
                 th.Start();
-                Log.W("启动 v1.0 dpi=" + Dpi());
+                Log.W("启动 v1.1.0 dpi=" + Dpi() + " 目录=" + baseDir);
                 Application.Run(form);
                 Log.W("退出");
                 GC.KeepAlive(mutex);
             }
             return 0;
+        }
+
+        static string QuitEventName(string baseDir)
+        {
+            using (MD5 md5 = MD5.Create())
+            {
+                byte[] h = md5.ComputeHash(Encoding.UTF8.GetBytes(baseDir.TrimEnd('\\').ToLowerInvariant()));
+                return @"Local\ClipShelf.Quit." + BitConverter.ToString(h, 0, 6).Replace("-", "");
+            }
         }
 
         static float Dpi()

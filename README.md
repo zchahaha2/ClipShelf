@@ -25,12 +25,17 @@ Windows 小工具，单个 exe，不用安装，不联网。
 
 ## 下载和使用
 
-1. 到 [Releases](../../releases) 下载 `ClipShelf.zip`，解压到一个普通文件夹（比如 `D:\Tools\ClipShelf`），不要放在 `C:\Program Files` 这类需要管理员权限的地方，因为截图和设置就存在 exe 旁边。
-2. 双击 `ClipShelf.exe`。屏幕右上角会出现一个小方块，之后截的图都会收进去。
-3. 右键小方块打开菜单，可以设置展开方式、开机自动启动、暂停收集、打开截图文件夹等。
-4. 想要桌面图标并设为开机自启，可以在命令行里运行一次 `ClipShelf.exe --install`。
+**安装版（推荐）**：到 [Releases](../../releases) 下载 `ClipShelf-Setup-1.1.0.exe`，双击按提示安装。
 
-第一次运行时，Windows 可能会提示"Windows 已保护你的电脑"，这是因为 exe 没有数字签名。点"更多信息"→"仍要运行"即可；不放心的话，可以按下面的方法用源码自己编译。
+- 装在当前用户的 `%LOCALAPPDATA%\Programs\ClipShelf`，不需要管理员权限。
+- 安装时可以选择创建桌面快捷方式、开机自动启动，默认都勾上。
+- 卸载：在"设置 → 应用"里找"截图盒 ClipShelf"。卸载会先关掉正在运行的截图盒，再删掉它保存的截图、设置和开机启动项。
+
+**免安装版**：下载 `ClipShelf-1.1.0-portable.zip`，解压到一个普通文件夹（比如 `D:\Tools\ClipShelf`），双击 `ClipShelf.exe`。不要放在 `C:\Program Files` 这类需要管理员权限的地方，因为截图和设置就存在 exe 旁边。想要桌面图标并开机自启，在这个文件夹里运行一次 `ClipShelf.exe --install`。
+
+运行后屏幕右上角会出现一个小方块，之后截的图都会收进去。右键小方块是菜单，可以设置展开方式、开机自动启动、暂停收集、打开截图文件夹等。
+
+第一次运行安装包或 exe 时，Windows 可能会提示"Windows 已保护你的电脑"，这是因为没有数字签名。点"更多信息"→"仍要运行"即可；不放心的话，可以按下面的方法用源码自己编译。
 
 需要 .NET Framework 4.x，Windows 10 和 11 都自带。
 
@@ -55,6 +60,8 @@ exe 所在文件夹下的 `shots\`，文件名是 `shot_日期_时间_编号.png
 ## 自己编译
 
 双击 `build.cmd`。它用的是 Windows 自带的 C# 编译器（`C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe`），不用装 Visual Studio。全部代码都在 `src\ClipShelf.cs` 这一个文件里。
+
+做安装包：先装 [Inno Setup 6](https://jrsoftware.org/isdl.php)，再运行 `build-installer.cmd`，安装包输出到 `dist\`。安装脚本是 `installer\ClipShelf.iss`，中文界面用的是 Inno Setup 官方仓库里的 `ChineseSimplified.isl`。
 
 ## 已知情况
 

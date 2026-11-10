@@ -8,3 +8,6 @@ probe*.txt
 # 编译产物（放到 Releases 里）
 *.exe
 *.zip
+
+# 安装包输出
+dist/

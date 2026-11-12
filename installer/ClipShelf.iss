@@ -3,7 +3,7 @@
 ; 按当前用户安装到 %LOCALAPPDATA%\Programs\ClipShelf，不需要管理员权限
 ; （截图盒把截图和设置存在 exe 旁边，所以必须装在用户自己能写的位置）
 
-#define AppVer "1.1.0"
+#define AppVer "1.3.0"
 
 [Setup]
 AppId={{B86E6B2C-8074-4FD3-8C6F-D3CC25076671}

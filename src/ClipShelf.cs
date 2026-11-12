@@ -6,6 +6,8 @@
 using System;
 using System.Collections.Generic;
 using System.Collections.Specialized;
+using System.Linq;
+using System.Threading.Tasks;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
@@ -23,11 +25,23 @@ using Microsoft.Win32;
 
 [assembly: AssemblyTitle("截图盒")]
 [assembly: AssemblyProduct("截图盒 ClipShelf")]
-[assembly: AssemblyVersion("1.1.0.0")]
-[assembly: AssemblyFileVersion("1.1.0.0")]
+[assembly: AssemblyVersion("1.3.0.0")]
+[assembly: AssemblyFileVersion("1.3.0.0")]
 
 namespace ClipShelf
 {
+    using WOcrEngine = global::Windows.Media.Ocr.OcrEngine;
+    using WOcrResult = global::Windows.Media.Ocr.OcrResult;
+    using WOcrLine = global::Windows.Media.Ocr.OcrLine;
+    using WOcrWord = global::Windows.Media.Ocr.OcrWord;
+    using WAsyncStatus = global::Windows.Foundation.AsyncStatus;
+    using WBitmapDecoder = global::Windows.Graphics.Imaging.BitmapDecoder;
+    using WSoftwareBitmap = global::Windows.Graphics.Imaging.SoftwareBitmap;
+    using WPixelFormat = global::Windows.Graphics.Imaging.BitmapPixelFormat;
+    using WAlphaMode = global::Windows.Graphics.Imaging.BitmapAlphaMode;
+    using WMemStream = global::Windows.Storage.Streams.InMemoryRandomAccessStream;
+    using WDataWriter = global::Windows.Storage.Streams.DataWriter;
+
     // ------------------------------------------------------------------ Win32
     static class W32
     {
@@ -153,7 +167,9 @@ namespace ClipShelf
                 sb.AppendLine("# GameProcs = 这些程序在前台时盒子自动隐藏（逗号分隔，进程名）");
                 sb.AppendLine("# MaxItems  = 盒子最多留几张，更早的自动删掉");
                 sb.AppendLine("# OpenMode  = click（点一下展开）或 hover（鼠标划过就展开）");
-                sb.AppendLine("# StayOpenSeconds = 截图后保持展开多少秒（每截一张重新计时）");
+                sb.AppendLine("# StayOpenSeconds = 自动展开后保持多少秒（每来一张重新计时）");
+                sb.AppendLine("# StayOpenMinShots = 一段时间内收到几张才自动展开（默认 2：只截一张不打扰）");
+                sb.AppendLine("# MultiShotWindowSeconds = 上面这“一段时间”有多长（秒）");
                 foreach (string k in order) sb.AppendLine(k + "=" + map[k]);
                 File.WriteAllText(file, sb.ToString(), new UTF8Encoding(true));
             }
@@ -853,7 +869,7 @@ namespace ClipShelf
         ShotItem downItem, lastToggled; Point downPt; bool downX, suppressUp, leftDown;
 
         public event Action SelectionChanged;
-        public event Action<ShotItem> CopyRequested;
+        public event Action<ShotItem> OpenRequested;
         public event Action<ShotItem> DeleteRequested;
         public event Action<ShotItem, Point> ItemMenuRequested;
         public Func<List<ShotItem>, DragDropEffects> DragRequested;
@@ -1047,14 +1063,14 @@ namespace ClipShelf
                 downItem = i >= 0 ? items[i] : null;
                 if (e.Clicks >= 2 && downItem != null && !onX)
                 {
-                    // 双击 = 复制；把第一下点出来的选中撤回去
+                    // 双击 = 放大查看 + 识别文字；把第一下点出来的选中撤回去
                     suppressUp = true;
                     if (lastToggled == downItem)
                     {
                         if (Selected.Contains(downItem)) Selected.Remove(downItem); else Selected.Add(downItem);
                         lastToggled = null; RaiseSel(); Invalidate();
                     }
-                    if (CopyRequested != null) CopyRequested(downItem);
+                    if (OpenRequested != null) OpenRequested(downItem);
                 }
             }
             else if (e.Button == MouseButtons.Right && i >= 0 && ItemMenuRequested != null)
@@ -1124,6 +1140,673 @@ namespace ClipShelf
         }
     }
 
+    // ------------------------------------------------------------------ 文字识别（Windows 自带 OCR，不联网）
+    class OcrLineBox { public string Text; public RectangleF Box; }
+    class OcrDoc { public List<OcrLineBox> Lines = new List<OcrLineBox>(); public string Text = ""; public string Error; public string Lang; public double Scale = 1; public int Added; }
+
+    static class Ocr
+    {
+        // 自己把 WinRT 异步转成 Task（不用 System.Runtime.WindowsRuntime 的扩展方法，它要 SDK 里的合并 Windows.winmd）
+        static Task<T> Await<T>(global::Windows.Foundation.IAsyncOperation<T> op)
+        {
+            TaskCompletionSource<T> tcs = new TaskCompletionSource<T>();
+            op.Completed = delegate(global::Windows.Foundation.IAsyncOperation<T> o, WAsyncStatus st)
+            {
+                if (st == WAsyncStatus.Completed) tcs.TrySetResult(o.GetResults());
+                else if (st == WAsyncStatus.Error) tcs.TrySetException(o.ErrorCode);
+                else tcs.TrySetCanceled();
+            };
+            return tcs.Task;
+        }
+
+        static bool Cjk(char c) { return (c >= 0x2E80 && c <= 0x9FFF) || (c >= 0xF900 && c <= 0xFAFF) || (c >= 0x3000 && c <= 0x303F) || (c >= 0xFF00 && c <= 0xFFEF); }
+
+        static readonly Dictionary<char, char> Half = new Dictionary<char, char>
+        { { '，', ',' }, { '．', '.' }, { '％', '%' }, { '：', ':' }, { '＋', '+' }, { '－', '-' }, { '／', '/' } };
+
+        // 数字/英文中间的全角符号改回半角：1，284 → 1,284；18．7 → 18.7；21％ → 21%
+        static string Normalize(string s)
+        {
+            char[] c = s.ToCharArray();
+            for (int i = 0; i < c.Length; i++)
+            {
+                if (c[i] >= '０' && c[i] <= '９') { c[i] = (char)('0' + (c[i] - '０')); continue; }
+                char r;
+                if (!Half.TryGetValue(c[i], out r)) continue;
+                bool prev = i > 0 && c[i - 1] < 128 && char.IsLetterOrDigit(c[i - 1]);
+                bool next = i + 1 < c.Length && c[i + 1] < 128 && char.IsLetterOrDigit(c[i + 1]);
+                if (r == '%' || r == '+' || r == '-') { if (prev || next) c[i] = r; }
+                else if (prev && next) c[i] = r;
+            }
+            return new string(c);
+        }
+
+        static bool IsAscii(char c) { return c > ' ' && c < 127; }
+
+        static readonly Dictionary<char, char> CodePunct = new Dictionary<char, char>
+        { { '，', ',' }, { '；', ';' }, { '：', ':' }, { '（', '(' }, { '）', ')' }, { '“', '"' }, { '”', '"' }, { '‘', '\'' }, { '’', '\'' }, { '！', '!' }, { '？', '?' }, { '【', '[' }, { '】', ']' }, { 'Ø', '0' } };
+
+        // 中文引擎认英文 / 数字 / 代码时常见的错，按上下文改：
+        //  · 整行基本是英文（非空白字符里汉字不到 1 成）→ 全角标点全改半角（代码行的 ；（ ）“ ”）
+        //  · 挨着英文/数字的 ；（ ）也改半角：Combine（ → Combine(、0；i → 0;i；中文里的（万元）不动
+        //  · 两个数字中间的“一” → “-”：2026一11一12 → 2026-11-12
+        //  · 数字之间的 l / I → 1，O → 0；版本号 vl.3 → v1.3
+        //  · 小写字母中间的大写 I → l：SheIf → Shelf；词首大写后面紧跟 I 再跟小写 → l：CIip → Clip
+        static bool D(char c) { return c >= '0' && c <= '9'; }
+        static bool Lo(char c) { return c >= 'a' && c <= 'z'; }
+        static bool AL(char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
+        static bool Ideo(char c) { return Cjk(c) && !(c >= 0x3000 && c <= 0x303F) && !(c >= 0xFF00 && c <= 0xFFEF); }
+
+        static readonly System.Text.RegularExpressions.Regex ExtRx = new System.Text.RegularExpressions.Regex(
+            @"^(jpe?g|png|gif|bmp|webp|tiff?|pdf|docx?|xlsx?|pptx?|txt|md|csv|json|zip|rar|7z|exe|msi|mp[34]|mov|mkv|wav|py|js|cs|cpp|html?)(?![A-Za-z0-9])",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+        static string Fix(string s)
+        {
+            // 整行算“英文行”：没有两个挨着的汉字，并且至少 3 个英文字母/数字（代码、英文句子）
+            int an = 0; bool pair = false;
+            for (int i = 0; i < s.Length; i++)
+            {
+                if (s[i] < 127 && char.IsLetterOrDigit(s[i])) an++;
+                if (i > 0 && Ideo(s[i]) && Ideo(s[i - 1])) pair = true;
+            }
+            bool asciiLine = !pair && an >= 3;
+            char[] c = s.ToCharArray();
+            bool[] wasWide = new bool[c.Length];
+            for (int i = 0; i < c.Length; i++)
+            {
+                char p = i > 0 ? c[i - 1] : ' ', n = i + 1 < c.Length ? c[i + 1] : ' ';
+                char p2 = i > 1 ? c[i - 2] : ' ', n2 = i + 2 < c.Length ? c[i + 2] : ' ';
+                // “像数字”的邻居：数字本身，或者小数点/千分位后面（前面）紧跟数字
+                bool pd = D(p) || ((p == '.' || p == ',') && D(p2)), nd = D(n) || ((n == '.' || n == ',') && D(n2));
+                char r;
+                if (CodePunct.TryGetValue(c[i], out r))
+                {
+                    if (asciiLine || (c[i] == '；' && (IsAscii(p) || IsAscii(n))) || (c[i] == '（' && n < 127 && char.IsLetterOrDigit(n) && p < 127)
+                        || (c[i] == '）' && p < 127 && char.IsLetterOrDigit(p) && !Cjk(n)) || c[i] == 'Ø')
+                    { wasWide[i] = c[i] == '；' || c[i] == '，'; c[i] = r; }
+                    continue;
+                }
+                if (c[i] == '一')
+                {
+                    // 两个数字中间 → 连字符（2026一11一12）；紧挨着百分数前面 → 负号（一3% → -3%）
+                    int j = i + 1;
+                    while (j < c.Length && (D(c[j]) || c[j] == '.')) j++;
+                    if ((D(p) && D(n)) || (j > i + 1 && j < c.Length && (c[j] == '%' || c[j] == '％'))) c[i] = '-';
+                    continue;
+                }
+                if ((c[i] == 'l' || c[i] == 'I') && ((pd && (nd || n == ' ' || n == '%')) || (nd && (pd || !AL(p)))
+                    || (p == 'v' && !AL(p2) && n == '.' && D(n2))))
+                { c[i] = '1'; continue; }
+                if (c[i] == 'O' && ((pd && !AL(n)) || (nd && !AL(p)))) { c[i] = '0'; continue; }
+                if (c[i] == 'I' && Lo(n) && (Lo(p) || (p >= 'A' && p <= 'Z' && !AL(p2)))) { c[i] = 'l'; continue; }
+                // 小写字母后面的 0 串：两个以上（t00 → too）或者后面还跟小写字母（g0od → good）；x0、y0 这种单个 0 结尾的不动
+                if (c[i] == '0' && Lo(p))
+                {
+                    int j = i;
+                    while (j < c.Length && c[j] == '0') j++;
+                    bool next = j < c.Length && Lo(c[j]), endWord = j >= c.Length || !char.IsLetterOrDigit(c[j]);
+                    bool noOtherDigit = true;
+                    for (int k = i - 1; k >= 0 && char.IsLetterOrDigit(c[k]) && c[k] < 127; k--) if (D(c[k])) noOtherDigit = false;
+                    if (noOtherDigit && (next || (endWord && j - i >= 2))) { for (int k = i; k < j; k++) c[k] = 'o'; i = j - 1; }
+                    continue;
+                }
+                if (c[i] == 'O' && Lo(p) && !AL(n)) { c[i] = 'o'; continue; }   // tO → to
+                if (c[i] == '·' && i == c.Length - 1 && Ideo(p)) c[i] = '。';      // 中文句末的句号被认成 ·
+            }
+            // 文件名里的点被认成逗号：旅行03,jpg → 旅行03.jpg（逗号后面紧跟常见扩展名、没有空格）
+            for (int i = 1; i + 2 < c.Length; i++)
+                if ((c[i] == ',' || c[i] == '，') && c[i - 1] != ' ' && ExtRx.IsMatch(new string(c, i + 1, c.Length - i - 1)))
+                { c[i] = '.'; wasWide[i] = false; }
+            // 全角 ；， 改成半角后，后面紧跟英文 / 数字时补一个空格（0；i → 0; i）
+            StringBuilder o = new StringBuilder(c.Length + 4);
+            for (int i = 0; i < c.Length; i++)
+            {
+                o.Append(c[i]);
+                if (wasWide[i] && i + 1 < c.Length && c[i + 1] < 127 && char.IsLetterOrDigit(c[i + 1])) o.Append(' ');
+            }
+            return o.ToString();
+        }
+
+        static WOcrEngine Engine(out string err)
+        {
+            err = null;
+            try
+            {
+                foreach (global::Windows.Globalization.Language l in WOcrEngine.AvailableRecognizerLanguages)
+                    if (l.LanguageTag.StartsWith("zh", StringComparison.OrdinalIgnoreCase)) return WOcrEngine.TryCreateFromLanguage(l);
+                WOcrEngine e = WOcrEngine.TryCreateFromUserProfileLanguages();
+                if (e == null) err = "NOLANG";
+                return e;
+            }
+            catch (Exception ex) { err = ex.Message; return null; }
+        }
+
+        class Wd
+        {
+            public string T;
+            public double X0, Y0, X1, Y1;
+            public double W { get { return X1 - X0; } }
+            public double H { get { return Y1 - Y0; } }
+        }
+
+        static double Median(List<double> v)
+        {
+            if (v.Count == 0) return 0;
+            List<double> c = new List<double>(v);
+            c.Sort();
+            return c[c.Count / 2];
+        }
+
+        // 行首被认成字的图标：排名圆圈、头像、小圆点。
+        // 规则：一个单独的圆形字符（0 O o ． · ● ○ …），差不多正方形，而且比旁边正文的字高出 30% 以上或矮一半左右。
+        const string IconChars = "0OoＯｏ〇○◯●•·．.°";
+        static bool LooksLikeIcon(List<Wd> ws, double globalH)
+        {
+            Wd f = ws[0];
+            if (f.T.Length != 1 || IconChars.IndexOf(f.T[0]) < 0) return false;
+            double aspect = f.W / Math.Max(1, f.H);
+            if (aspect < 0.6 || aspect > 1.6) return false;
+            double refH = ws.Count > 1 ? Median(ws.Skip(1).Select(q => q.H).ToList()) : globalH;
+            if (refH <= 0) return false;
+            double r = f.H / refH;
+            return r >= 1.3 || r <= 0.6;
+        }
+
+        static async Task<List<OcrLineBox>> Pass(WOcrEngine eng, Bitmap src, double scale)
+        {
+            double max = WOcrEngine.MaxImageDimension;
+            scale = Math.Min(scale, max / Math.Max(src.Width, src.Height));
+            int w = Math.Max(1, (int)(src.Width * scale)), h = Math.Max(1, (int)(src.Height * scale));
+            byte[] png;
+            using (Bitmap dst = new Bitmap(w, h, PixelFormat.Format32bppArgb))
+            {
+                using (Graphics g = Graphics.FromImage(dst))
+                {
+                    g.Clear(Color.White);   // 透明背景当白底
+                    g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                    g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                    g.DrawImage(src, 0, 0, w, h);
+                }
+                using (MemoryStream ms = new MemoryStream()) { dst.Save(ms, ImageFormat.Png); png = ms.ToArray(); }
+            }
+            WMemStream ras = new WMemStream();
+            WDataWriter dw = new WDataWriter(ras);
+            dw.WriteBytes(png);
+            await Await(dw.StoreAsync());
+            dw.DetachStream();
+            ras.Seek(0);
+            WBitmapDecoder dec = await Await(WBitmapDecoder.CreateAsync(ras));
+            WSoftwareBitmap sb = await Await(dec.GetSoftwareBitmapAsync(WPixelFormat.Bgra8, WAlphaMode.Premultiplied));
+            WOcrResult r = await Await(eng.RecognizeAsync(sb));
+
+            // 1. 每行的词和位置（换算回原图坐标）
+            List<List<Wd>> raw = new List<List<Wd>>();
+            List<double> allH = new List<double>();
+            foreach (WOcrLine line in r.Lines)
+            {
+                List<Wd> ws = new List<Wd>();
+                foreach (WOcrWord wd in line.Words)
+                {
+                    if (string.IsNullOrEmpty(wd.Text)) continue;
+                    var bb = wd.BoundingRect;
+                    Wd x = new Wd();
+                    x.T = wd.Text; x.X0 = bb.X / scale; x.Y0 = bb.Y / scale; x.X1 = (bb.X + bb.Width) / scale; x.Y1 = (bb.Y + bb.Height) / scale;
+                    ws.Add(x); allH.Add(x.H);
+                }
+                if (ws.Count > 0) raw.Add(ws);
+            }
+            double gh = Median(allH);
+
+            List<OcrLineBox> list = new List<OcrLineBox>();
+            foreach (List<Wd> ws in raw)
+            {
+                // 2. 去掉行首图标
+                if (LooksLikeIcon(ws, gh)) ws.RemoveAt(0);
+                if (ws.Count == 0) continue;
+                // 3. 拼字，空格按图上的实际间距来：英文/数字之间空白 ≥ 行高 0.18 倍才算有空格（+ 1 2% → +12%）；
+                //    中英文交界 ≥ 0.3 倍才算有空格（汉字自带左右留白）；两个汉字之间从不加空格
+                double lh = ws.Max(q => q.Y1) - ws.Min(q => q.Y0);
+                StringBuilder t = new StringBuilder();
+                Wd prev = null;
+                foreach (Wd x in ws)
+                {
+                    if (prev != null)
+                    {
+                        char pc = t[t.Length - 1], nc = x.T[0];
+                        bool ca = Cjk(pc), cb = Cjk(nc);
+                        double gap = x.X0 - prev.X1;
+                        bool sign = prev.T == "+" || prev.T == "-" || prev.T == "−";   // 正负号自带留白：+ 12% 其实是 +12%
+                        bool digits = D(pc) && D(nc);   // 数字等宽、“1”的墨迹很窄：拆开的 1 2% 实测间距 0.31 倍数字高，按 0.38 倍数字高分
+                        if (gap > 2 * lh) t.Append("    ");                            // 同一行里隔得很远（表格的两格）
+                        else if (!ca && !cb ? (digits ? gap >= 0.38 * Math.Max(prev.H, x.H) : gap >= (sign ? 0.3 : 0.18) * lh)   // 英文 / 数字之间
+                                 : ca && cb ? false                                          // 中文之间从不加空格
+                                 : (ca && !Ideo(pc)) || (cb && !Ideo(nc)) ? false              // 全角标点（：，；）自带留白，旁边不加空格
+                                 : gap >= 0.3 * lh)                                          // 汉字和英文交界
+                            t.Append(' ');
+                    }
+                    t.Append(x.T);
+                    prev = x;
+                }
+                string text = Fix(Normalize(t.ToString())).Trim();
+                if (text.Length == 0) continue;
+                double x0 = ws.Min(q => q.X0), y0 = ws.Min(q => q.Y0), x1 = ws.Max(q => q.X1), y1 = ws.Max(q => q.Y1);
+                OcrLineBox lb = new OcrLineBox();
+                lb.Text = text; lb.Box = new RectangleF((float)x0, (float)y0, (float)(x1 - x0), (float)(y1 - y0));
+                list.Add(lb);
+            }
+            return list;
+        }
+
+        // 两个框重叠面积超过小的那个的 30% 就算同一处
+        static bool Overlaps(RectangleF a, RectangleF b)
+        {
+            RectangleF i = RectangleF.Intersect(a, b);
+            if (i.Width <= 0 || i.Height <= 0) return false;
+            return i.Width * i.Height > 0.3 * Math.Min(a.Width * a.Height, b.Width * b.Height);
+        }
+
+        static int Score(List<OcrLineBox> l)
+        {
+            int n = 0;
+            foreach (OcrLineBox b in l) foreach (char c in b.Text) if (char.IsLetterOrDigit(c) || Cjk(c)) n++;
+            return n;
+        }
+
+        static double MedianHeight(List<OcrLineBox> l)
+        {
+            return Median(l.Select(q => (double)q.Box.Height).ToList());
+        }
+
+        public static Task<OcrDoc> RecognizeAsync(string path) { return RecognizeAsync(path, null); }
+
+        // first：第一遍（原图）认完就先报一次，界面可以先显示；放大那遍认完再返回最终结果
+        public static async Task<OcrDoc> RecognizeAsync(string path, IProgress<OcrDoc> first)
+        {
+            OcrDoc doc = new OcrDoc();
+            string err;
+            WOcrEngine eng = Engine(out err);
+            if (eng == null) { doc.Error = err ?? "NOLANG"; return doc; }
+            doc.Lang = eng.RecognizerLanguage.LanguageTag;
+            using (Bitmap src = Shots.LoadFile(path))
+            {
+                List<OcrLineBox> best = await Pass(eng, src, 1.0);
+                // 字小（行高 < 24 像素）或者几乎没认出来时，放大 2 倍再认一遍：
+                // 认出有效字多的那次为主，另一次只用来补主结果里没有字的位置（和主结果的框不重叠的行）
+                double mh = MedianHeight(best);
+                if ((best.Count == 0 || mh < 24) && Math.Max(src.Width, src.Height) * 2 <= WOcrEngine.MaxImageDimension)
+                {
+                    if (first != null && best.Count > 0)
+                    {
+                        OcrDoc d1 = new OcrDoc();
+                        d1.Lang = doc.Lang; d1.Lines = new List<OcrLineBox>(best); d1.Text = Layout(best);
+                        first.Report(d1);
+                    }
+                    List<OcrLineBox> up = await Pass(eng, src, 2.0);
+                    List<OcrLineBox> extra = best;
+                    if (Score(up) > Score(best)) { extra = best; best = up; doc.Scale = 2; } else extra = up;
+                    int added = 0;
+                    foreach (OcrLineBox e in extra)
+                        if (!best.Any(q => Overlaps(q.Box, e.Box))) { best.Add(e); added++; }
+                    doc.Added = added;
+                }
+                doc.Lines = best;
+                doc.Text = Layout(best);
+            }
+            return doc;
+        }
+
+        // 版面还原：同一水平线上的按从左到右拼成一行（表格一行一行读）；
+        // 只有真正的两栏正文才分栏读。
+        public static string Layout(List<OcrLineBox> lines)
+        {
+            if (lines.Count == 0) return "";
+            double h = Math.Max(4, MedianHeight(lines));
+            return Block(lines, h).Trim();
+        }
+
+        // 分栏规则：中间有一条比一个字还宽的竖直空白缝，而且左右两边各有至少 3 行宽度超过 8 个字高的长行。
+        // 表格的格子都短，不满足这一条，所以表格不会被拆成一列一列。
+        static string Block(List<OcrLineBox> b, double h)
+        {
+            List<OcrLineBox> byX = b.OrderBy(q => q.Box.Left).ToList();
+            double maxR = byX[0].Box.Right, bestGap = 0;
+            int best = -1;
+            for (int i = 1; i < byX.Count; i++)
+            {
+                double g = byX[i].Box.Left - maxR;
+                if (g > h && g > bestGap)
+                {
+                    int lw = byX.Take(i).Count(q => q.Box.Width >= 8 * h), rw = byX.Skip(i).Count(q => q.Box.Width >= 8 * h);
+                    if (lw >= 3 && rw >= 3) { bestGap = g; best = i; }
+                }
+                maxR = Math.Max(maxR, byX[i].Box.Right);
+            }
+            if (best > 0) return Block(byX.GetRange(0, best), h) + "\n\n" + Block(byX.GetRange(best, byX.Count - best), h);
+            return Rows(b, h);
+        }
+
+        // 分行：竖直中心相差不到半个行高的算同一行。分段：行间空白比这块里一般的行距大 60% 以上（且超过一个字高）就空一行。
+        static string Rows(List<OcrLineBox> b, double h)
+        {
+            List<OcrLineBox> sorted = b.OrderBy(q => q.Box.Top + q.Box.Height / 2).ToList();
+            List<List<OcrLineBox>> rows = new List<List<OcrLineBox>>();
+            foreach (OcrLineBox l in sorted)
+            {
+                List<OcrLineBox> last = rows.Count > 0 ? rows[rows.Count - 1] : null;
+                if (last != null)
+                {
+                    double cy = last.Average(q => q.Box.Top + q.Box.Height / 2.0), lh = Math.Max(l.Box.Height, last.Max(q => q.Box.Height));
+                    if (Math.Abs(cy - (l.Box.Top + l.Box.Height / 2.0)) < lh * 0.5) { last.Add(l); continue; }
+                }
+                rows.Add(new List<OcrLineBox> { l });
+            }
+            List<double> gaps = new List<double>();
+            for (int i = 1; i < rows.Count; i++) gaps.Add(rows[i].Min(q => q.Box.Top) - rows[i - 1].Max(q => q.Box.Bottom));
+            double para = Math.Max(h, 1.6 * Median(gaps));
+
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < rows.Count; i++)
+            {
+                if (i > 0) sb.Append(gaps[i - 1] > para ? "\n\n" : "\n");
+                OcrLineBox prev = null;
+                foreach (OcrLineBox l in rows[i].OrderBy(q => q.Box.Left))
+                {
+                    if (prev != null)
+                    {
+                        double gap = l.Box.Left - prev.Box.Right;
+                        char a = prev.Text[prev.Text.Length - 1], c0 = l.Text[0];
+                        sb.Append(gap > 2 * h ? "    " : (Cjk(a) || Cjk(c0) ? "" : " "));
+                    }
+                    sb.Append(l.Text);
+                    prev = l;
+                }
+            }
+            return sb.ToString();
+        }
+    }
+
+    // ------------------------------------------------------------------ 放大查看（双击打开）
+    class ImageView : Control
+    {
+        readonly Bitmap img;
+        readonly Metrics m;
+        readonly Font hintFont;
+        List<OcrLineBox> boxes = new List<OcrLineBox>();
+        bool showBoxes = true, fit = true, panning, moved;
+        float zoom = 1;
+        PointF origin;
+        int hover = -1;
+        Point downPt;
+        PointF downOrigin;
+        public event Action<OcrLineBox> BoxClicked;
+
+        public ImageView(Bitmap img, Metrics m)
+        {
+            this.img = img; this.m = m;
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint | ControlStyles.ResizeRedraw | ControlStyles.Selectable, true);
+            BackColor = Color.FromArgb(20, 21, 23);
+            hintFont = new Font("Microsoft YaHei UI", 8.5f);
+        }
+
+        public List<OcrLineBox> Boxes { set { boxes = value ?? new List<OcrLineBox>(); hover = -1; Invalidate(); } }
+        public bool ShowBoxes { set { showBoxes = value; hover = -1; Invalidate(); } }
+
+        void Fit()
+        {
+            int pad = m.Px(24);
+            float s = Math.Min((Width - 2 * pad) / (float)img.Width, (Height - 2 * pad - m.Px(20)) / (float)img.Height);
+            zoom = Math.Max(0.02f, Math.Min(s, 3f));
+            origin = new PointF((Width - img.Width * zoom) / 2, (Height - m.Px(20) - img.Height * zoom) / 2);
+        }
+
+        RectangleF ToScreen(RectangleF b)
+        {
+            RectangleF r = new RectangleF(origin.X + b.X * zoom, origin.Y + b.Y * zoom, b.Width * zoom, b.Height * zoom);
+            r.Inflate(3, 2);
+            return r;
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            g.Clear(BackColor);
+            if (fit) Fit();
+            RectangleF ir = new RectangleF(origin.X, origin.Y, img.Width * zoom, img.Height * zoom);
+            using (SolidBrush sh = new SolidBrush(Color.FromArgb(70, 0, 0, 0))) g.FillRectangle(sh, ir.X + 4, ir.Y + 6, ir.Width, ir.Height);
+            g.InterpolationMode = zoom >= 3 ? InterpolationMode.NearestNeighbor : InterpolationMode.HighQualityBicubic;
+            g.PixelOffsetMode = PixelOffsetMode.Half;
+            g.DrawImage(img, ir);
+            if (showBoxes)
+            {
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                for (int i = 0; i < boxes.Count; i++)
+                {
+                    RectangleF r = ToScreen(boxes[i].Box);
+                    using (SolidBrush b = new SolidBrush(Color.FromArgb(i == hover ? 70 : 26, Theme.Accent))) g.FillRectangle(b, r);
+                    using (Pen p = new Pen(Color.FromArgb(i == hover ? 255 : 150, Theme.Accent), i == hover ? 2f : 1.2f)) g.DrawRectangle(p, r.X, r.Y, r.Width, r.Height);
+                }
+            }
+            TextRenderer.DrawText(g, "滚轮缩放 · 拖动平移 · 双击还原" + (showBoxes && boxes.Count > 0 ? " · 点蓝框复制那一行" : ""), hintFont,
+                new Rectangle(m.Px(12), Height - m.Px(26), Width - m.Px(24), m.Px(22)), Theme.Sub, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+        }
+
+        int HitBox(Point p)
+        {
+            if (!showBoxes) return -1;
+            for (int i = 0; i < boxes.Count; i++) if (ToScreen(boxes[i].Box).Contains(p)) return i;
+            return -1;
+        }
+
+        protected override void OnMouseWheel(MouseEventArgs e)
+        {
+            base.OnMouseWheel(e);
+            float f = e.Delta > 0 ? 1.18f : 1 / 1.18f;
+            float nz = Math.Max(0.05f, Math.Min(16f, zoom * f));
+            origin = new PointF(e.X - (e.X - origin.X) * nz / zoom, e.Y - (e.Y - origin.Y) * nz / zoom);
+            zoom = nz; fit = false;
+            Invalidate();
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            Focus();
+            if (e.Button != MouseButtons.Left) return;
+            panning = true; moved = false; downPt = e.Location; downOrigin = origin;
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            if (panning)
+            {
+                int dx = e.X - downPt.X, dy = e.Y - downPt.Y;
+                if (Math.Abs(dx) + Math.Abs(dy) > 4) moved = true;
+                if (moved) { origin = new PointF(downOrigin.X + dx, downOrigin.Y + dy); fit = false; Cursor = Cursors.SizeAll; Invalidate(); }
+                return;
+            }
+            int h = HitBox(e.Location);
+            if (h != hover) { hover = h; Cursor = h >= 0 ? Cursors.Hand : Cursors.Default; Invalidate(); }
+        }
+
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            base.OnMouseUp(e);
+            if (!panning) return;
+            panning = false;
+            Cursor = hover >= 0 ? Cursors.Hand : Cursors.Default;
+            if (!moved && e.Button == MouseButtons.Left)
+            {
+                int h = HitBox(e.Location);
+                if (h >= 0 && BoxClicked != null) BoxClicked(boxes[h]);
+            }
+        }
+
+        protected override void OnDoubleClick(EventArgs e)
+        {
+            base.OnDoubleClick(e);
+            if (HitBox(PointToClient(Cursor.Position)) >= 0) return;
+            fit = true; Invalidate();
+        }
+    }
+
+    class ViewerForm : Form
+    {
+        readonly ShotItem item;
+        readonly Bitmap bmp;
+        readonly ImageView view;
+        readonly TextBox text;
+        readonly Label status;
+        readonly Action<ShotItem> copyImage;
+        public bool OcrDone;   // 调试截图用
+
+        public ViewerForm(ShotItem item, Metrics m, Action<ShotItem> copyImage)
+        {
+            this.item = item; this.copyImage = copyImage;
+            Text = "截图盒 · " + item.Time.ToString("MM-dd HH:mm:ss") + " · " + item.W + "×" + item.H;
+            try { Icon = new Icon(new MemoryStream(AppIcon.BuildIco()), SystemInformation.IconSize); } catch { }
+            BackColor = Theme.Body; ForeColor = Theme.Text;
+            Font = new Font("Microsoft YaHei UI", 9.5f);
+            KeyPreview = true;
+            StartPosition = FormStartPosition.Manual;
+            AutoScaleMode = AutoScaleMode.None;
+            Rectangle wa = Screen.FromPoint(Cursor.Position).WorkingArea;
+            int w = Math.Min(wa.Width - 60, Math.Max(m.Px(900), (int)(wa.Width * 0.74)));
+            int h = Math.Min(wa.Height - 60, Math.Max(m.Px(560), (int)(wa.Height * 0.8)));
+            Bounds = new Rectangle(wa.Left + (wa.Width - w) / 2, wa.Top + (wa.Height - h) / 2, w, h);
+            MinimumSize = new Size(m.Px(720), m.Px(420));
+
+            bmp = Shots.LoadFile(item.Path);
+            view = new ImageView(bmp, m);
+            view.Dock = DockStyle.Fill;
+
+            Panel side = new Panel();
+            side.Dock = DockStyle.Right; side.Width = m.Px(380); side.BackColor = Theme.Header;
+            side.Padding = new Padding(m.Px(14), m.Px(12), m.Px(14), m.Px(12));
+            Label title = new Label();
+            title.Text = "识别出的文字"; title.Dock = DockStyle.Top; title.Height = m.Px(30);
+            title.Font = new Font("Microsoft YaHei UI", 11f, FontStyle.Bold); title.ForeColor = Theme.Text;
+            status = new Label();
+            status.Dock = DockStyle.Top; status.Height = m.Px(50); status.ForeColor = Theme.Sub; status.Text = "正在识别文字……";
+            text = new TextBox();
+            text.Multiline = true; text.ScrollBars = ScrollBars.Vertical; text.WordWrap = true; text.Dock = DockStyle.Fill;
+            text.BackColor = Theme.Card; text.ForeColor = Theme.Text; text.BorderStyle = BorderStyle.None;
+            text.Font = new Font("Microsoft YaHei UI", 10.5f);
+            text.TextChanged += delegate { if (!settingText) userEdited = true; };
+            Panel textWrap = new Panel();
+            textWrap.Dock = DockStyle.Fill; textWrap.BackColor = Theme.Card; textWrap.Padding = new Padding(m.Px(10));
+            textWrap.Controls.Add(text);
+            CheckBox boxes = new CheckBox();
+            boxes.Text = "在图上标出认出的文字"; boxes.Checked = true; boxes.ForeColor = Theme.Sub; boxes.Dock = DockStyle.Bottom; boxes.Height = m.Px(34);
+            boxes.CheckedChanged += delegate { view.ShowBoxes = boxes.Checked; };
+            FlowLayoutPanel buttons = new FlowLayoutPanel();
+            buttons.Dock = DockStyle.Bottom; buttons.Height = m.Px(92); buttons.Padding = new Padding(0, m.Px(8), 0, 0);
+            buttons.Controls.Add(MakeButton("复制全部文字", true, m, delegate { CopyAllText(); }));
+            buttons.Controls.Add(MakeButton("复制图片", false, m, delegate { copyImage(item); status.Text = "图片已复制，可以 Ctrl+V"; }));
+            buttons.Controls.Add(MakeButton("在文件夹中显示", false, m, delegate { try { Process.Start("explorer.exe", "/select,\"" + item.Path + "\""); } catch { } }));
+            side.Controls.Add(textWrap);
+            side.Controls.Add(boxes);
+            side.Controls.Add(buttons);
+            side.Controls.Add(status);
+            side.Controls.Add(title);
+            Controls.Add(view);
+            Controls.Add(side);
+
+            view.BoxClicked += delegate(OcrLineBox line)
+            {
+                try { Clipboard.SetText(line.Text); } catch { }
+                status.Text = "已复制这一行：" + (line.Text.Length > 30 ? line.Text.Substring(0, 30) + "…" : line.Text);
+            };
+            KeyDown += delegate(object s2, KeyEventArgs e)
+            {
+                if (e.KeyCode == Keys.Escape) Close();
+            };
+            Shown += delegate { view.Focus(); RunOcr(); };
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            try { int on = 1; W32.DwmSetWindowAttribute(Handle, 20, ref on, 4); } catch { }   // 深色标题栏（Win10 20H1+ / Win11）
+        }
+
+        static Button MakeButton(string label, bool accent, Metrics m, EventHandler click)
+        {
+            Button b = new Button();
+            b.Text = label; b.AutoSize = true; b.FlatStyle = FlatStyle.Flat; b.FlatAppearance.BorderSize = 0;
+            b.BackColor = accent ? Theme.Accent : Theme.Pill; b.ForeColor = Color.White;
+            b.Padding = new Padding(m.Px(8), m.Px(3), m.Px(8), m.Px(3)); b.Margin = new Padding(0, 0, m.Px(8), m.Px(8));
+            b.Cursor = Cursors.Hand;
+            b.Click += click;
+            return b;
+        }
+
+        void CopyAllText()
+        {
+            string t = text.SelectionLength > 0 ? text.SelectedText : text.Text;
+            if (t.Trim().Length == 0) { status.Text = "没有可复制的文字"; return; }
+            try { Clipboard.SetText(t); status.Text = text.SelectionLength > 0 ? "已复制选中的文字" : "全部文字已复制"; }
+            catch (Exception ex) { status.Text = "复制失败：" + ex.Message; }
+        }
+
+        async void RunOcr()
+        {
+            System.Diagnostics.Stopwatch sw = System.Diagnostics.Stopwatch.StartNew();
+            try
+            {
+                string path = item.Path;
+                bool partialShown = false;
+                // Progress 在界面线程上建，第一遍的结果会自动回到界面线程显示
+                Progress<OcrDoc> firstPass = new Progress<OcrDoc>(delegate(OcrDoc d1)
+                {
+                    if (IsDisposed || OcrDone) return;
+                    ShowResult(d1);
+                    partialShown = true;
+                    status.Text = "已认出 " + d1.Lines.Count + " 行，正在放大再认一遍补漏……";
+                });
+                OcrDoc doc = await Task.Run(() => Ocr.RecognizeAsync(path, firstPass));   // 放到后台线程，大图也不卡界面
+                if (IsDisposed) return;
+                if (doc.Error == "NOLANG")
+                {
+                    status.Text = "这台电脑没装中文文字识别：设置 → 时间和语言 → 语言和区域 → 中文（简体）→ 语言选项 → 装上“光学字符识别”";
+                    status.Height = status.Height * 2;
+                    return;
+                }
+                if (doc.Error != null) { status.Text = "识别失败：" + doc.Error; return; }
+                bool kept = partialShown && userEdited;
+                if (!kept) ShowResult(doc); else view.Boxes = doc.Lines;
+                status.Text = doc.Lines.Count == 0 ? "没有认出文字"
+                    : "认出 " + doc.Lines.Count + " 行（" + (sw.ElapsedMilliseconds < 1000 ? sw.ElapsedMilliseconds + " 毫秒" : (sw.ElapsedMilliseconds / 1000.0).ToString("0.0") + " 秒") + "）"
+                      + (kept ? "· 你改过文字，没有覆盖" : "· 可以直接改、选中复制");
+                Log.W("文字识别 " + Path.GetFileName(item.Path) + "：" + doc.Lines.Count + " 行（另一次补了 " + doc.Added + " 行），" + sw.ElapsedMilliseconds + " ms，主结果放大 " + doc.Scale + " 倍，语言 " + doc.Lang);
+            }
+            catch (Exception ex)
+            {
+                if (!IsDisposed) status.Text = "识别失败：" + ex.Message;
+                Log.W("文字识别失败: " + ex);
+            }
+            finally { OcrDone = true; }
+        }
+
+        bool settingText, userEdited;
+
+        void ShowResult(OcrDoc d)
+        {
+            view.Boxes = d.Lines;
+            settingText = true;
+            text.Text = d.Text.Replace("\r", "").Replace("\n", "\r\n");
+            text.SelectionStart = 0; text.SelectionLength = 0;
+            settingText = false;
+        }
+
+        protected override void OnFormClosed(FormClosedEventArgs e)
+        {
+            base.OnFormClosed(e);
+            bmp.Dispose();
+        }
+    }
+
     // ------------------------------------------------------------------ 主窗口
     class ShelfForm : Form
     {
@@ -1169,7 +1852,8 @@ namespace ClipShelf
         int outsideSince, graceUntil;
         readonly System.Windows.Forms.Timer hoverTimer = new System.Windows.Forms.Timer();
         bool hoverOpen, stayAfterShot;
-        int stayOpenSec;
+        int stayOpenSec, stayMinShots, multiShotWindowSec;
+        readonly List<DateTime> recentShots = new List<DateTime>();
         DateTime stayOpenUntil = DateTime.MinValue;
         W32.WinEventDelegate fgHookProc;
         IntPtr fgHook = IntPtr.Zero;
@@ -1194,6 +1878,8 @@ namespace ClipShelf
             hoverOpen = cfg.Get("OpenMode", "click").ToLowerInvariant() == "hover";
             stayAfterShot = cfg.GetBool("StayOpenAfterShot", true);
             stayOpenSec = Math.Max(5, Math.Min(600, cfg.GetInt("StayOpenSeconds", 60)));
+            stayMinShots = Math.Max(1, Math.Min(10, cfg.GetInt("StayOpenMinShots", 2)));
+            multiShotWindowSec = Math.Max(10, Math.Min(3600, cfg.GetInt("MultiShotWindowSeconds", 120)));
             paused = cfg.GetBool("Paused", false);
             excludeCapture = cfg.GetBool("HideFromScreenshots", true);
             maxItems = Math.Max(5, Math.Min(500, cfg.GetInt("MaxItems", 40)));
@@ -1212,7 +1898,7 @@ namespace ClipShelf
             Controls.Add(header);
 
             view.SelectionChanged += delegate { header.SelCount = view.Selected.Count; header.Invalidate(); };
-            view.CopyRequested += CopyItem;
+            view.OpenRequested += OpenViewer;
             view.DeleteRequested += delegate(ShotItem it) { RemoveItem(it); AfterItemsChanged(); };
             view.ItemMenuRequested += ShowItemMenu;
             view.DragRequested = DoDrag;
@@ -1506,16 +2192,23 @@ namespace ClipShelf
             if (Math.Abs(f - header.StayFraction) > 0.001f) { header.StayFraction = f; header.Invalidate(); }
         }
 
-        // 有新截图：展开并保持 stayOpenSec 秒（每来一张重新计时）
-        void OnShotActivity()
+        // 来了一张图（截图或复制的图片）：
+        // 只来一张 → 不打扰，小块闪一下；一段时间内来了第二张及以上 → 自动展开并保持 stayOpenSec 秒（每来一张重新计时）
+        // 面板本来就开着时，来新图也续上保持时间
+        // countIt=false：重复的图（截图工具常把同一张图连着放进剪贴板两次）不算“又来了一张”
+        void OnShotActivity(bool countIt = true)
         {
-            if (stayAfterShot)
+            DateTime now = DateTime.Now;
+            recentShots.RemoveAll(delegate(DateTime t) { return (now - t).TotalSeconds > multiShotWindowSec; });
+            if (countIt) recentShots.Add(now);
+            bool multi = countIt && recentShots.Count >= stayMinShots;
+            if (stayAfterShot && (multi || !collapsed))
             {
-                stayOpenUntil = DateTime.Now.AddSeconds(stayOpenSec);
-                if (collapsed) Expand(0);
+                stayOpenUntil = now.AddSeconds(stayOpenSec);
+                if (collapsed) { Expand(0); Log.W("自动展开：" + multiShotWindowSec + " 秒内第 " + recentShots.Count + " 张"); }
                 UpdateStayBar();
             }
-            else if (collapsed) { header.FlashUntil = DateTime.Now.AddMilliseconds(1400); flashTimer.Start(); }
+            else if (collapsed) { header.FlashUntil = now.AddMilliseconds(1400); flashTimer.Start(); }
         }
 
         void SetOpenMode(bool hover)
@@ -1554,9 +2247,70 @@ namespace ClipShelf
                 catch (ExternalException) { Thread.Sleep(80); }
                 catch (Exception ex) { Log.W("读剪贴板出错: " + ex.Message); break; }
             }
-            if (bmp == null) return;
+            if (bmp == null)
+            {
+                List<string> files = null;
+                try { files = ReadClipboardImageFiles(); } catch (Exception ex) { Log.W("读复制的文件出错: " + ex.Message); }
+                if (files != null && files.Count > 0)
+                {
+                    string src = from;
+                    ThreadPool.QueueUserWorkItem(delegate { ImportFiles(files, src); });
+                }
+                return;
+            }
             DateTime now = DateTime.Now;
             ThreadPool.QueueUserWorkItem(delegate { SaveInBackground(bmp, now, from); });
+        }
+
+        static readonly string[] ImageExts = { ".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff" };
+        const int MaxFilesPerCopy = 9;   // 一次复制超过 9 个文件多半是在搬文件，不收（微信一次也最多发 9 张）
+
+        // 在文件夹里复制的图片文件（Ctrl+C 选中的照片）
+        List<string> ReadClipboardImageFiles()
+        {
+            if (!Clipboard.ContainsFileDropList()) return null;
+            StringCollection sc = Clipboard.GetFileDropList();
+            List<string> imgs = new List<string>();
+            foreach (string f in sc)
+            {
+                if (Directory.Exists(f)) return null;   // 带文件夹的复制不收
+                string ext = Path.GetExtension(f).ToLowerInvariant();
+                if (Array.IndexOf(ImageExts, ext) < 0) continue;
+                if (!File.Exists(f)) continue;
+                if (string.Equals(Path.GetDirectoryName(f).TrimEnd('\\'), shotsDir.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase)) continue;
+                if (new FileInfo(f).Length > 60L * 1024 * 1024) continue;
+                imgs.Add(f);
+            }
+            if (imgs.Count > MaxFilesPerCopy) { Log.W("一次复制了 " + imgs.Count + " 张图片文件，超过 " + MaxFilesPerCopy + " 张，不收"); return null; }
+            return imgs;
+        }
+
+        void ImportFiles(List<string> files, string from)
+        {
+            foreach (string f in files)
+            {
+                try
+                {
+                    DateTime now = DateTime.Now;
+                    using (Bitmap bmp = Shots.LoadFile(f))
+                    {
+                        string hash = Shots.HashOf(bmp);
+                        bool dup;
+                        lock (hashLock) dup = hashes.Contains(hash);
+                        if (dup) { BeginInvoke(new Action(delegate { BumpToTop(hash); })); continue; }
+                        string ext = Path.GetExtension(f).ToLowerInvariant();
+                        if (ext == ".jpeg") ext = ".jpg";
+                        if (ext == ".tiff") ext = ".tif";
+                        string path = Path.Combine(shotsDir, "shot_" + now.ToString("yyyyMMdd_HHmmss_fff", CultureInfo.InvariantCulture) + "_" + hash + ext);
+                        File.Copy(f, path, false);
+                        ShotItem it = Shots.Make(path, hash, now, bmp, m);
+                        string src = "复制的文件 " + Path.GetFileName(f) + (from.Length > 0 ? "（" + from + "）" : "");
+                        BeginInvoke(new Action(delegate { AddNew(it, src); }));
+                    }
+                    Thread.Sleep(5);   // 文件名里的毫秒不重复
+                }
+                catch (Exception ex) { Log.W("导入复制的图片失败 " + f + ": " + ex.Message); }
+            }
         }
 
         Bitmap ReadClipboardImage(out string from)
@@ -1633,7 +2387,8 @@ namespace ClipShelf
             view.ScrollToTop();
             flashTimer.Start();
             bool wasCollapsed = collapsed;
-            OnShotActivity();
+            OnShotActivity(false);
+            Log.W("同一张图又进了剪贴板（不计数）");
             if (!wasCollapsed) Toast("盒子里已有这张", false, 1600);
         }
 
@@ -1651,7 +2406,9 @@ namespace ClipShelf
             List<ShotItem> loaded = new List<ShotItem>();
             try
             {
-                List<string> files = new List<string>(Directory.GetFiles(shotsDir, "shot_*.png"));
+                List<string> files = new List<string>();
+                foreach (string f in Directory.GetFiles(shotsDir, "shot_*.*"))
+                    if (Array.IndexOf(ImageExts, Path.GetExtension(f).ToLowerInvariant()) >= 0) files.Add(f);
                 files.Sort(StringComparer.Ordinal);
                 files.Reverse();   // 文件名里带时间，新的在前
                 for (int i = 0; i < files.Count; i++)
@@ -1716,6 +2473,33 @@ namespace ClipShelf
             Log.W("清空 " + n + " 张");
         }
 
+        // ---------------- 放大查看（双击）
+        readonly Dictionary<string, ViewerForm> viewers = new Dictionary<string, ViewerForm>(StringComparer.OrdinalIgnoreCase);
+
+        void OpenViewer(ShotItem it)
+        {
+            if (!File.Exists(it.Path)) { Toast("文件找不到了", true, 1600); return; }
+            ViewerForm v;
+            if (viewers.TryGetValue(it.Path, out v) && !v.IsDisposed)
+            {
+                if (v.WindowState == FormWindowState.Minimized) v.WindowState = FormWindowState.Normal;
+                v.Activate(); W32.SetForegroundWindow(v.Handle);
+                return;
+            }
+            try
+            {
+                v = new ViewerForm(it, m, CopyItem);
+                viewers[it.Path] = v;
+                string key = it.Path;
+                v.FormClosed += delegate { viewers.Remove(key); };
+                if (autoCollapse) Collapse();
+                v.Show();
+                v.Activate();
+                W32.SetForegroundWindow(v.Handle);
+            }
+            catch (Exception ex) { Toast("打开失败", true, 1600); Log.W("打开查看窗口失败: " + ex.Message); }
+        }
+
         // ---------------- 复制 / 拖出
         void CopyItem(ShotItem it)
         {
@@ -1728,7 +2512,8 @@ namespace ClipShelf
                 {
                     DataObject d = new DataObject();
                     d.SetData(DataFormats.Bitmap, true, bmp);
-                    d.SetData("PNG", false, new MemoryStream(bytes));
+                    if (string.Equals(Path.GetExtension(it.Path), ".png", StringComparison.OrdinalIgnoreCase))
+                        d.SetData("PNG", false, new MemoryStream(bytes));
                     ignoreUntil = Environment.TickCount + 1500;
                     Clipboard.SetDataObject(d, true, 5, 100);
                 }
@@ -1825,7 +2610,7 @@ namespace ClipShelf
             mainMenu.Items.Add(mHover);
 
             string stayText = stayOpenSec % 60 == 0 ? (stayOpenSec / 60) + " 分钟" : stayOpenSec + " 秒";
-            ToolStripMenuItem stay = new ToolStripMenuItem("截图后保持展开 " + stayText);
+            ToolStripMenuItem stay = new ToolStripMenuItem((stayMinShots <= 1 ? "截图后" : "连收" + stayMinShots + "张以上") + "自动展开 " + stayText);
             stay.Checked = stayAfterShot;
             stay.Click += delegate
             {
@@ -1906,7 +2691,9 @@ namespace ClipShelf
             show.Click += delegate { try { Process.Start("explorer.exe", "/select,\"" + it.Path + "\""); } catch { } };
             ToolStripMenuItem del = new ToolStripMenuItem("删除这张");
             del.Click += delegate { RemoveItem(it); AfterItemsChanged(); };
-            cm.Items.Add(copy); cm.Items.Add(show); cm.Items.Add(new ToolStripSeparator()); cm.Items.Add(del);
+            ToolStripMenuItem open = new ToolStripMenuItem("放大查看 · 识别文字（双击）");
+            open.Click += delegate { OpenViewer(it); };
+            cm.Items.Add(open); cm.Items.Add(copy); cm.Items.Add(show); cm.Items.Add(new ToolStripSeparator()); cm.Items.Add(del);
             cm.Opened += delegate { menuOpen = true; };
             cm.Closed += delegate { menuOpen = false; outsideSince = 0; BeginInvoke(new Action(cm.Dispose)); };
             W32.SetForegroundWindow(Handle);
@@ -1946,6 +2733,8 @@ namespace ClipShelf
             if (a0 == "--install") { Install(baseDir); return 0; }
             if (a0 == "--uninstall") { try { Autostart.Set(false); } catch { } return 0; }
             if (a0 == "--snapshot") return Snapshot(args);
+            if (a0 == "--ocr") return OcrCli(args);
+            if (a0 == "--viewer-snapshot") return ViewerSnapshot(args);
             if (a0 == "--quit")
             {
                 // 安装 / 卸载程序用：让从这个文件夹运行的截图盒正常退出（别处的副本不受影响）
@@ -2004,7 +2793,7 @@ namespace ClipShelf
                 });
                 th.IsBackground = true;
                 th.Start();
-                Log.W("启动 v1.1.0 dpi=" + Dpi() + " 目录=" + baseDir);
+                Log.W("启动 v1.3.0 dpi=" + Dpi() + " 目录=" + baseDir);
                 Application.Run(form);
                 Log.W("退出");
                 GC.KeepAlive(mutex);
@@ -2065,6 +2854,52 @@ namespace ClipShelf
         }
 
         // --snapshot out.png --dir 截图目录 [--select 0,2] [--hover 1] [--hoverx] [--collapsed] [--toast 文字] [--empty]
+        // --ocr out.txt img1 [img2 ...]：只跑文字识别，把结果和每行位置写进 out.txt（调试用）
+        static int OcrCli(string[] args)
+        {
+            StringBuilder sb = new StringBuilder();
+            for (int i = 2; i < args.Length; i++)
+            {
+                string img = args[i];
+                Stopwatch sw = Stopwatch.StartNew();
+                OcrDoc d = System.Threading.Tasks.Task.Run(() => Ocr.RecognizeAsync(img)).Result;
+                sb.AppendLine("==== " + Path.GetFileName(img) + "  lines=" + d.Lines.Count + "  scale=" + d.Scale + "+" + d.Added + "  lang=" + d.Lang + "  " + sw.ElapsedMilliseconds + " ms" + (d.Error != null ? "  ERROR=" + d.Error : ""));
+                sb.AppendLine(d.Text);
+                sb.AppendLine("---- boxes");
+                foreach (OcrLineBox l in d.Lines)
+                    sb.AppendLine(string.Format(CultureInfo.InvariantCulture, "[{0:0},{1:0} {2:0}x{3:0}] {4}", l.Box.X, l.Box.Y, l.Box.Width, l.Box.Height, l.Text));
+                sb.AppendLine();
+            }
+            File.WriteAllText(args[1], sb.ToString(), new UTF8Encoding(true));
+            return 0;
+        }
+
+        // --viewer-snapshot out.png img [宽 高]：在屏幕外打开查看窗口、等识别完，存成图片（调试用，不在屏幕上出现）
+        static int ViewerSnapshot(string[] args)
+        {
+            string img = args[2];
+            int w = args.Length > 3 ? int.Parse(args[3]) : 1600, h = args.Length > 4 ? int.Parse(args[4]) : 900;
+            ShotItem it = new ShotItem();
+            it.Path = img; it.Time = File.GetLastWriteTime(img);
+            using (Bitmap b0 = Shots.LoadFile(img)) { it.W = b0.Width; it.H = b0.Height; }
+            ViewerForm v = new ViewerForm(it, new Metrics(Dpi()), delegate(ShotItem x) { });
+            v.ShowInTaskbar = false;
+            v.MinimumSize = new Size(100, 100);
+            v.Bounds = new Rectangle(-32000, -32000, w, h);
+            v.Show();
+            v.Bounds = new Rectangle(-32000, -32000, w, h);
+            Stopwatch sw = Stopwatch.StartNew();
+            while (!v.OcrDone && sw.ElapsedMilliseconds < 20000) { Application.DoEvents(); Thread.Sleep(15); }
+            for (int i = 0; i < 5; i++) { Application.DoEvents(); Thread.Sleep(20); }
+            using (Bitmap b = new Bitmap(v.Width, v.Height))
+            {
+                v.DrawToBitmap(b, new Rectangle(0, 0, v.Width, v.Height));
+                b.Save(args[1], ImageFormat.Png);
+            }
+            v.Close();
+            return 0;
+        }
+
         static int Snapshot(string[] args)
         {
             string outPng = args[1], dir = null, toast = null;

@@ -2,7 +2,7 @@
 
 截图自动收进屏幕边上的小盒子，要发的时候拖出去就行。
 
-Windows 小工具，单个 exe，不用安装，不联网。
+Windows 小工具，单个 exe，不用安装。截图收集和文字识别在本机完成；配置百度翻译后，点击“翻译”才会联网发送文字。
 
 ![截图盒演示](docs/demo.gif)
 
@@ -18,6 +18,7 @@ Windows 小工具，单个 exe，不用安装，不联网。
 - **连收两张才自动展开**：只截一张时不打扰你，小块闪一下、数字加 1，直接 Ctrl+V 就行；2 分钟内收到第二张，才自动展开并保持 1 分钟（每来一张重新计时），标题栏下面那条蓝线就是剩下的时间。时间到了、鼠标也不在上面，就自己收起来。
 - **一次拖好几张**：点选几张（左上角会标出 1、2、3 的顺序），拖其中任意一张，选中的会一起拖出去。拖出去的是图片文件，和从资源管理器里拖文件一样，聊天软件、网页上传框、文件夹都能接。
 - **双击放大、认出图里的字**：双击一张图，打开一个大窗口看（滚轮缩放、拖动平移），右边自动列出图里的文字，可以直接改、选中复制，或者一键复制全部；点图上的蓝框，复制那一行。表格按行读，两栏的文章按栏读。用的是 Windows 自带的文字识别，全在本机完成，不联网。
+- **按需翻译文字**：在大图窗口选中一段识别文字再点“翻译”，只翻译这一段；未选中时翻译整个文字框。源语言由百度自动检测。目标语言默认“自动（中英）”：文字以中文为主时译成英文，其余译成中文，也可以从下拉框手动选语言。译文显示在右侧，可复制。仅点击“翻译”后才会将文字发送给百度，图片不会上传。使用前需在 `settings.ini` 配置自己的百度通用文本翻译凭据。
 - **也能复制粘贴**：右键一张选"复制"，之后按 Ctrl+V；选了几张时，右键可以一起复制。
 - **截图时拍不到它**：盒子挡在要截的内容上面也没关系，截出来的图里没有它。
 - **全屏时自动隐藏**：全屏游戏、全屏视频、幻灯片放映时，它自动藏起来。还可以指定某个程序在前台时隐藏，默认已经包含雷电、MuMu 模拟器。
@@ -56,6 +57,10 @@ Windows 小工具，单个 exe，不用安装，不联网。
 | `MaxItems` | `40` | 最多保留几张 |
 | `GameProcs` | `dnplayer.exe,MuMuPlayer.exe,MuMuNxDevice.exe` | 这些程序在前台时隐藏 |
 | `HideFromScreenshots` | `1` | 截图时不把盒子拍进去 |
+| `BAIDU_APP_ID` | 空 | 百度翻译开放平台的 APPID |
+| `BAIDU_APP_KEY` | 空 | 百度翻译开放平台的密钥 |
+
+可在截图盒右键菜单的“打开截图文件夹”下方点击“填写百度翻译密钥”，在弹窗中输入 APPID 和 APPKEY 并保存，立即生效。也可以退出程序后手动编辑 `settings.ini`，再重新打开。`settings.ini` 已被 `.gitignore` 排除，不要把密钥写进源码或提交到 GitHub。百度标准版单次请求上限为 1000 字符；程序将较长的文字分段翻译，并按标准版速率依次请求。
 
 ## 截图存在哪
 
@@ -76,7 +81,7 @@ exe 所在文件夹下的 `shots\`，文件名是 `shot_日期_时间_编号.png
 
 ## English
 
-ClipShelf keeps every screenshot you take (any tool: Win+Shift+S, PrintScreen, chat apps, Snipaste…) in a small always-on-top shelf at the edge of the screen. Click it to open, select a few shots, and drag them into a chat window, an upload box or a folder. It opens for a minute when a second screenshot arrives within two minutes, also collects images you copy, and a double-click opens a shot large with built-in text recognition (Windows OCR, fully offline). It stays out of your screenshots, hides while a full-screen app or game is in front, and never steals focus. Single ~150 KB exe (installer or portable zip), no network. MIT licensed.
+ClipShelf keeps every screenshot you take (any tool: Win+Shift+S, PrintScreen, chat apps, Snipaste…) in a small always-on-top shelf at the edge of the screen. Click it to open, select a few shots, and drag them into a chat window, an upload box or a folder. It opens for a minute when a second screenshot arrives within two minutes, also collects images you copy, and a double-click opens a shot large with built-in text recognition (Windows OCR, fully offline). Optional Baidu text translation sends recognized text only when you click Translate. It stays out of your screenshots, hides while a full-screen app or game is in front, and never steals focus. Single exe (installer or portable zip). MIT licensed.
 
 ## 许可
 
